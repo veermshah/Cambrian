@@ -92,7 +92,8 @@ Recommended cadence: 3–5 Codex tasks in flight at a time; one Claude Code chun
 
 ## Conventions every prompt assumes
 
-- Go 1.22+. One module rooted at the repo. Layout per spec lines 917–1113.
+- Go 1.22+. One module rooted at `github.com/veermshah/cambrian`. Layout per spec lines 917–1113.
+- **Hosted infra:** Postgres on Supabase, Redis on Upstash. Local Postgres / Redis are only used in unit tests via `testcontainers-go` and `miniredis`. Two Postgres URLs exist: `DATABASE_URL` (direct, used by migrations) and `DATABASE_POOL_URL` (pgBouncer pooled, used by the app's `pgx.Pool`). Always use `DATABASE_URL` for `golang-migrate`; always use `DATABASE_POOL_URL` for the app pool. `REDIS_URL` is an Upstash `rediss://...` TLS endpoint.
 - All env vars added to `.env.example` in the same PR that introduces them. Never commit `.env`.
 - All LLM calls go through `LLMClient.Complete` and write a row to `agent_ledgers` (chunk 15 makes this enforceable; chunk 6 lays the cost-tracking groundwork).
 - All wallet bytes encrypted at rest with AES-256-GCM (chunk 7). zap field redactor must be installed before any code that handles keys or LLM output.
@@ -122,9 +123,9 @@ Create a buildable Go module with the directory tree from spec lines 917–1113,
 
 ### In scope
 
-- `go.mod` with module path `github.com/<user>/cambrian` (ask for the path in PR description if unclear; default to `github.com/veermickey/cambrian`)
-- `internal/config/config.go`: struct with fields for `NETWORK`, Postgres URL, Redis URL, Anthropic key, OpenAI key, Helius URL, Alchemy URL, Telegram bot token + chat id, master encryption key, monthly budget USD, log level. Use `os.Getenv` + a small required/optional helper. No third-party config libs.
-- `.env.example` listing every variable from `config.go` with a one-line comment each.
+- `go.mod` with module path `github.com/veermshah/cambrian` (lowercase per Go convention; GitHub repo URL is case-insensitive)
+- `internal/config/config.go`: struct with fields for `NETWORK`, `DATABASE_URL` (Supabase direct connection — used by migrations), `DATABASE_POOL_URL` (Supabase pooled / pgBouncer connection — used by the app's `pgx.Pool`; falls back to `DATABASE_URL` if unset), `REDIS_URL` (Upstash `rediss://...` with TLS), Anthropic key, OpenAI key, Helius URL, Alchemy URL, Telegram bot token + chat id, master encryption key, monthly budget USD, log level. Use `os.Getenv` + a small required/optional helper. No third-party config libs.
+- `.env.example` listing every variable from `config.go` with a one-line comment each. Include short comments noting the Supabase direct-vs-pooled distinction and that `REDIS_URL` should be the Upstash TLS endpoint (`rediss://...`).
 - `Dockerfile` (multi-stage, scratch final, copies `swarm` binary).
 - `cmd/swarm/main.go` that calls `config.Load()`, logs the network and exits 0.
 - Empty `internal/...` directory tree per spec lines 917–1031 (use `.gitkeep` files to anchor empty dirs).
@@ -165,17 +166,17 @@ Create a buildable Go module with the directory tree from spec lines 917–1113,
 
 ### Context
 
-Spec lines 645–913 contain the full SQL schema. Chunk 1 has scaffolded the module and `internal/db/` directory.
+Spec lines 645–913 contain the full SQL schema. Chunk 1 has scaffolded the module and `internal/db/` directory. Production Postgres is hosted on **Supabase**; production Redis is hosted on **Upstash**. Supabase exposes two endpoints — a direct connection (`db.<ref>.supabase.co:5432`) and a pooled pgBouncer connection (`<ref>.pooler.supabase.com:6543`) — and they have different constraints.
 
 ### Goal
 
-Set up `pgx/v5` connection pooling, write a migration runner using `golang-migrate`, and translate the entire schema in spec lines 645–913 into versioned migration files. Provide a `db.Queries` struct with stubs for the most common reads/writes (full implementations land in later chunks).
+Set up `pgx/v5` connection pooling, write a migration runner using `golang-migrate`, and translate the entire schema in spec lines 645–913 into versioned migration files. Provide a `db.Queries` struct with stubs for the most common reads/writes (full implementations land in later chunks). Code must work cleanly against both Supabase (production) and a local Postgres 16 in tests.
 
 ### In scope
 
-- `internal/db/db.go`: `pgx.Pool` factory from `DATABASE_URL`, with sensible pool size (max 20).
-- `internal/db/migrate.go`: runs migrations on startup using `github.com/golang-migrate/migrate/v4`.
-- `internal/db/migrations/0001_init.up.sql` and `0001_init.down.sql`: every `CREATE TABLE`, `CREATE INDEX`, and `CONSTRAINT` from spec lines 646–913. Group logically (one migration is fine; do not split across files).
+- `internal/db/db.go`: `pgx.Pool` factory. Reads `DATABASE_POOL_URL` first (Supabase pgBouncer / pooled), falls back to `DATABASE_URL`. Pool size max 20. Because Supabase pgBouncer runs in **transaction pooling mode**, set `pgxpool.Config.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeExec` (or use `prefer_simple_protocol=true` in the URL) — prepared statements are not safe across pgBouncer transaction boundaries.
+- `internal/db/migrate.go`: runs migrations on startup using `github.com/golang-migrate/migrate/v4`. **Always uses `DATABASE_URL` (the direct connection)**, never the pooled URL — `golang-migrate` requires advisory locks and prepared statements that pgBouncer in transaction mode does not support.
+- `internal/db/migrations/0001_init.up.sql` and `0001_init.down.sql`: every `CREATE TABLE`, `CREATE INDEX`, and `CONSTRAINT` from spec lines 646–913. Group logically (one migration is fine; do not split across files). All schema must work on Supabase (Postgres 15+) — avoid extensions Supabase does not enable by default; if you need `pgcrypto` for `gen_random_uuid()`, include `CREATE EXTENSION IF NOT EXISTS pgcrypto;` at the top of the up migration.
 - `internal/db/queries.go`: skeleton with `type Queries struct { pool *pgxpool.Pool }` and stub method signatures (returning `errors.New("not implemented")`) for: `InsertAgent`, `GetAgent`, `ListActiveAgents`, `LogTrade`, `LogStrategistDecision`, `InsertEpoch`, `InsertOffspringProposal`, `InsertPostmortem`, `InsertLedgerRow`. Real implementations come later — for now, signatures only.
 - `cmd/swarm/main.go` updated to call `db.Run()` migrations on startup.
 
@@ -183,18 +184,22 @@ Set up `pgx/v5` connection pooling, write a migration runner using `golang-migra
 
 - Implementing the query bodies (chunks 9, 14, 15, 21 fill these in).
 - Any seeding (chunk 32).
+- Supabase row-level security / auth (we are the only client; auth handled by `API_KEY` at the API layer).
 
 ### Acceptance criteria
 
 - `go build ./...` and `go vet ./...` pass.
-- Migration runs cleanly against an empty Postgres 16 instance and is idempotent (running twice is a no-op).
+- Migration runs cleanly against a Supabase project and is idempotent (running twice is a no-op).
+- Migration also runs cleanly against an empty local Postgres 16 instance (proves it isn't Supabase-coupled).
 - All FK constraints validate (no `REFERENCES` to a table created later).
 - Down migration drops everything cleanly.
+- App pool successfully executes a `SELECT 1` through the pooled URL without a "prepared statement does not exist" error.
 
 ### Tests
 
 - `internal/db/db_test.go`: spins up a Postgres instance via `testcontainers-go`, runs up + down migrations, verifies all expected tables exist after up and are gone after down.
 - Skip the test if `TESTCONTAINERS_DISABLED=1` is set.
+- Optional `internal/db/supabase_smoke_test.go` (gated by `INTEGRATION=1`): connects to the configured Supabase pooled URL, runs `SELECT 1`, asserts no errors.
 
 ### PR
 
@@ -448,17 +453,17 @@ Provide three primitives the rest of the system uses without thinking: `key_mana
 
 ### Context
 
-Spec lines 552–606 define `AgentGenome` and its sub-structs. The Redis wrapper is used for pub/sub on the intel bus (chunk 22) and for transient state caching.
+Spec lines 552–606 define `AgentGenome` and its sub-structs. The Redis wrapper is used for pub/sub on the intel bus (chunk 22) and for transient state caching. Production Redis is hosted on **Upstash** (TLS endpoint, `rediss://...`).
 
 ### Goal
 
-Translate the entire genome model from spec lines 552–606 into Go. Provide a Redis client wrapper used by all later chunks.
+Translate the entire genome model from spec lines 552–606 into Go. Provide a Redis client wrapper used by all later chunks. Wrapper must work cleanly against Upstash (production) and a local Redis 7 (tests).
 
 ### In scope
 
 - `internal/agent/genome.go`: `AgentGenome`, `SleepSchedule`, `ReproductionPolicy`, `CostPolicy`, `CommunicationPolicy`, `LearnedRule`. JSON tags must match the spec exactly so they round-trip with the DB JSONB columns.
 - `internal/agent/genome_validate.go`: `(g *AgentGenome) Validate() error` enforcing: non-empty name, generation ≥ 0, `task_type` in the registry set, `chain` in `{solana, base}`, `strategist_model` in the LLM registry, all `*_pct` fields in `[0, 100]`, all `*_usd` fields ≥ 0.
-- `internal/redis/redis.go`: thin wrapper around `go-redis/v9`. Methods: `Publish(ctx, channel string, value any) error` (JSON-encodes), `Subscribe(ctx, channels ...string) <-chan Message`, `Set/Get` for key-value. Handles connection retry.
+- `internal/redis/redis.go`: thin wrapper around `go-redis/v9`. Constructor parses `REDIS_URL` via `redis.ParseURL` so it picks up the `rediss://` TLS scheme used by Upstash automatically. Methods: `Publish(ctx, channel string, value any) error` (JSON-encodes), `Subscribe(ctx, channels ...string) <-chan Message`, `Set/Get` for key-value. Handles connection retry with backoff. Note in code comment that Upstash's free tier caps at 10k commands/day — every consumer should use `Subscribe` (one persistent connection) rather than per-call polling.
 - `internal/redis/fake.go`: in-memory fake for tests.
 
 ### Out of scope
