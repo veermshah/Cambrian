@@ -1,3 +1,3 @@
-module github.com/veermickey/cambrian
+module github.com/veermshah/cambrian
 
 go 1.22

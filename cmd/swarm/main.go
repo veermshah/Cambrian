@@ -11,7 +11,7 @@ import (
 	"log"
 	"os"
 
-	"github.com/veermickey/cambrian/internal/config"
+	"github.com/veermshah/cambrian/internal/config"
 )
 
 func main() {
