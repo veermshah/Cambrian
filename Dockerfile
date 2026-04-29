@@ -3,7 +3,7 @@
 # single binary into a scratch image. Result: a minimal runtime container
 # with no shell, no package manager, and a tiny attack surface.
 
-FROM golang:1.22-alpine AS builder
+FROM golang:1.25-alpine AS builder
 WORKDIR /src
 
 # Cache module downloads in a separate layer for fast incremental builds.
