@@ -1,3 +1,12 @@
 .claude/settings.local.json
 .env
 .env.local
+
+# Build artifacts
+bin/
+*.test
+*.out
+
+# Agent / skill metadata
+.agents/
+skills-lock.json

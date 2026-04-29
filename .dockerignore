@@ -1,0 +1,30 @@
+# Anything not needed inside the Docker build context.
+.git/
+.github/
+.gitignore
+.dockerignore
+
+# Local secrets — never let them into image layers.
+.env
+.env.local
+
+# Build artifacts.
+bin/
+*.test
+*.out
+
+# Editor / agent / skill metadata.
+.claude/
+.agents/
+.vscode/
+.idea/
+skills-lock.json
+
+# Documentation isn't needed in the runtime image.
+docs/
+README.md
+LICENSE
+*.md
+
+# Dashboard is a separate deployment.
+dashboard/
