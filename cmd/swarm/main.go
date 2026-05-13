@@ -1,10 +1,10 @@
 // Command swarm is the main entry point for the Cambrian agent swarm.
 //
-// At this stage (chunk 2) the binary loads configuration, runs DB migrations
-// against the direct Postgres URL, opens the application connection pool,
-// pings it, and exits cleanly. Later chunks add: Redis (chunk 3), the
-// SwarmRuntime (chunk 14), the RootOrchestrator (chunk 21), the API server
-// (chunk 29), and the Telegram notifier (chunk 28).
+// At this stage (post-chunk 9) the binary loads configuration, runs DB
+// migrations against the direct Postgres URL, opens the application
+// connection pool, verifies the root treasury exists, and exits cleanly.
+// Later chunks add: the SwarmRuntime (chunk 14), RootOrchestrator
+// (chunk 21), the API server (chunk 29), and Telegram (chunk 28).
 package main
 
 import (
@@ -46,5 +46,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Printf("network=%s db=ok\n", cfg.Network)
+	q := db.NewQueries(pool)
+	ready, err := q.TreasuryInitialized(ctx)
+	if err != nil {
+		log.Printf("treasury check: %v", err)
+		os.Exit(1)
+	}
+	if !ready {
+		log.Printf("treasury not initialized — run `go run ./cmd/init-treasury` first")
+		os.Exit(1)
+	}
+
+	fmt.Printf("network=%s db=ok treasury=ready\n", cfg.Network)
 }
