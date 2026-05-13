@@ -365,18 +365,9 @@ func TestCrossChainYield_GetStateSummaryShape(t *testing.T) {
 }
 
 func TestCrossChainYield_FactoryRequiresDeps(t *testing.T) {
-	// Make sure the registered init() factory complains when no deps
-	// are wired. Use a fresh registry to be safe.
-	ResetForTest()
-	t.Cleanup(func() {
-		ResetForTest()
-		// Re-run init via direct Register so subsequent tests see
-		// cross_chain_yield in the registry.
-		Register("cross_chain_yield", crossChainYieldFactory)
-	})
-	Register("cross_chain_yield", crossChainYieldFactory)
-
-	// Stash and clear deps pointer for the duration of the test.
+	// Don't touch the registry — clearing it leaks into other tests
+	// that exercise sibling factories. Just nil out the deps pointer
+	// for the duration of the test.
 	prev := crossChainYieldDeps.Load()
 	crossChainYieldDeps.Store(nil)
 	t.Cleanup(func() { crossChainYieldDeps.Store(prev) })
