@@ -21,11 +21,12 @@ import (
 type FakeLLMClient struct {
 	mu sync.Mutex
 
-	model        string
-	response     string
-	inputTokens  int
-	outputTokens int
-	failNext     error
+	model         string
+	response      string
+	responseQueue []string
+	inputTokens   int
+	outputTokens  int
+	failNext      error
 
 	calls []FakeCall
 }
@@ -52,6 +53,17 @@ func (f *FakeLLMClient) WithResponse(s string) *FakeLLMClient {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.response = s
+	return f
+}
+
+// WithResponseQueue sets a queue of responses returned in order, one per
+// Complete call. When the queue is exhausted, the fake falls back to the
+// single response set by WithResponse (empty if unset). Useful for
+// multi-call flows like the adversarial bull/bear/synthesis pipeline.
+func (f *FakeLLMClient) WithResponseQueue(rs ...string) *FakeLLMClient {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.responseQueue = append([]string(nil), rs...)
 	return f
 }
 
@@ -86,8 +98,13 @@ func (f *FakeLLMClient) Complete(_ context.Context, system, user string, maxToke
 	if maxTokens <= 0 {
 		return nil, errors.New("fake llm: maxTokens must be > 0")
 	}
+	content := f.response
+	if len(f.responseQueue) > 0 {
+		content = f.responseQueue[0]
+		f.responseQueue = f.responseQueue[1:]
+	}
 	return &LLMResponse{
-		Content:      f.response,
+		Content:      content,
 		InputTokens:  f.inputTokens,
 		OutputTokens: f.outputTokens,
 		CostUSD:      computeCost(f.model, f.inputTokens, f.outputTokens),
