@@ -76,6 +76,14 @@ func (c *fakeClock) Fire() {
 	}
 }
 
+// Advance moves the clock forward by d. Does not fire tickers — call
+// Fire afterward if you also want to deliver a tick.
+func (c *fakeClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(d)
+}
+
 // FireFor pushes one tick onto only the ticker whose interval equals d.
 // Lets a test advance just the heartbeat loop, etc.
 func (c *fakeClock) FireFor(d time.Duration) {

@@ -67,6 +67,12 @@ type NodeRunnerConfig struct {
 	// MaxOutputTokens caps the strategist's LLM response. Zero ⇒ 1024.
 	MaxOutputTokens int
 
+	// Breaker is the global circuit breaker. When non-nil and tripped,
+	// monitor + strategist loops skip their work this tick. Heartbeat
+	// keeps firing so operators can distinguish "halted by breaker"
+	// from "node crashed". Nil ⇒ no breaker check (test default).
+	Breaker *CircuitBreaker
+
 	Clock Clock
 }
 
@@ -192,6 +198,9 @@ func (n *NodeRunner) monitorLoop(ctx context.Context) error {
 			if n.paused.Load() {
 				continue
 			}
+			if n.cfg.Breaker != nil && n.cfg.Breaker.Halted() {
+				continue
+			}
 			n.tickCount.Add(1)
 			trades, err := n.cfg.Task.RunTick(ctx)
 			if err != nil {
@@ -236,6 +245,9 @@ func (n *NodeRunner) strategistLoop(ctx context.Context) error {
 			return nil
 		case <-tk.C():
 			if n.paused.Load() {
+				continue
+			}
+			if n.cfg.Breaker != nil && n.cfg.Breaker.Halted() {
 				continue
 			}
 			if err := n.runStrategistOnce(ctx); err != nil {
