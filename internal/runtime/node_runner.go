@@ -73,6 +73,22 @@ type NodeRunnerConfig struct {
 	// from "node crashed". Nil ⇒ no breaker check (test default).
 	Breaker *CircuitBreaker
 
+	// Hibernation is the Hermes-style shadow-node sleep scheduler. When
+	// non-nil, monitor + strategist loops consult it before doing work
+	// — sleeping shadows skip their tick without burning RPC or LLM
+	// budget. nil ⇒ no hibernation (always awake). Funded nodes are
+	// unaffected regardless of the scheduler being present.
+	Hibernation *HibernationScheduler
+	// NodeClass is "funded" or "shadow". Hibernation consults it to
+	// decide whether to apply the sleep gate. Empty ⇒ treated as
+	// funded (always awake).
+	NodeClass string
+	// HibernationAnchor is the per-agent reference time the sleep
+	// cycle pivots on. The runtime passes the agent's created_at;
+	// tests pass whatever timestamp makes their fixture deterministic.
+	// Zero ⇒ falls back to time.Time{} (cycle starts at the epoch).
+	HibernationAnchor time.Time
+
 	Clock Clock
 }
 
@@ -201,6 +217,9 @@ func (n *NodeRunner) monitorLoop(ctx context.Context) error {
 			if n.cfg.Breaker != nil && n.cfg.Breaker.Halted() {
 				continue
 			}
+			if !n.isAwake() {
+				continue
+			}
 			n.tickCount.Add(1)
 			trades, err := n.cfg.Task.RunTick(ctx)
 			if err != nil {
@@ -250,12 +269,31 @@ func (n *NodeRunner) strategistLoop(ctx context.Context) error {
 			if n.cfg.Breaker != nil && n.cfg.Breaker.Halted() {
 				continue
 			}
+			if !n.isAwake() {
+				continue
+			}
 			if err := n.runStrategistOnce(ctx); err != nil {
 				n.cfg.Log.Warnw("strategist_cycle_failed",
 					"agent_id", n.cfg.AgentID, "error", err)
 			}
 		}
 	}
+}
+
+// isAwake consults the optional hibernation scheduler. Returns true
+// when no scheduler is wired (test default) or when the agent is in
+// its awake window. Funded agents always return true regardless of
+// the scheduler being present.
+func (n *NodeRunner) isAwake() bool {
+	if n.cfg.Hibernation == nil {
+		return true
+	}
+	return n.cfg.Hibernation.IsAwake(
+		n.cfg.NodeClass,
+		n.cfg.Genome.SleepSchedule,
+		n.cfg.HibernationAnchor,
+		n.cfg.StrategistInterval,
+	)
 }
 
 // runStrategistOnce is the per-tick body, factored out so tests can
