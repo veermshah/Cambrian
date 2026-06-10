@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"golang.org/x/sync/errgroup"
@@ -31,6 +32,7 @@ import (
 	"github.com/veermshah/cambrian/internal/db"
 	"github.com/veermshah/cambrian/internal/llm"
 	"github.com/veermshah/cambrian/internal/notifications"
+	"github.com/veermshah/cambrian/internal/orchestrator"
 	"github.com/veermshah/cambrian/internal/redis"
 	"github.com/veermshah/cambrian/internal/runtime"
 )
@@ -153,7 +155,7 @@ func run() error {
 			{"solana", "SOL/USDC"},
 			{"base", "ETH/USDC"},
 		},
-		Store: backtesting.NewInMemoryPriceStore(),
+		Store: priceStoreAdapter{queries: queries},
 	})
 	if err != nil {
 		return fmt.Errorf("price collector: %w", err)
@@ -208,13 +210,35 @@ func run() error {
 	})
 	log.Info("swarm.boot.api_ok", zap.String("addr", addr))
 
-	// 6e) RootOrchestrator cron — placeholder. The production EpochStore
-	// binding lives in a future chunk; until then we log the gap rather
-	// than wire a fake into production.
-	log.Warn("swarm.boot.orchestrator_skipped",
-		zap.String("reason", "production EpochStore not yet implemented"),
-		zap.String("tracker", "TODO: chunks after 32 wire orchestrator.EpochStore against pgx pool"),
-	)
+	// 6e) RootOrchestrator + epoch cron. PostgresEpochStore wires the
+	// orchestrator against the live pool; the cron loop seeds an epoch
+	// row, runs RunEpoch, and sleeps until the next cadence. Anthropic
+	// is required because quality-check + adversarial-review +
+	// postmortem all go through LLM.Get.
+	strategistLLM, llmErr := llm.Get("claude-haiku-4-5-20251001")
+	if llmErr != nil {
+		log.Warn("swarm.boot.orchestrator_skipped",
+			zap.String("reason", "strategist model unavailable"),
+			zap.Error(llmErr),
+		)
+	} else {
+		epochStore := orchestrator.NewPostgresEpochStore(pool)
+		lifecycle := runtime.NewLifecycleManager(queries, rdb, loggerAdapter{log: log})
+		breaker := breakerAdapter{} // simple ≥50%-stop-out gate; see comment
+		orch, err := orchestrator.NewRootOrchestrator(orchestrator.RootOrchestratorConfig{
+			Store:              epochStore,
+			Lifecycle:          lifecycle,
+			Breaker:            breaker,
+			Bus:                eventBusAdapter{rdb: rdb},
+			LLM:                strategistLLM,
+			LifecyclePolicyCfg: orchestrator.DefaultLifecyclePolicyConfig(),
+		})
+		if err != nil {
+			return fmt.Errorf("orchestrator: %w", err)
+		}
+		group.Go(func() error { return runEpochCron(gctx, log, pool, orch, epochCadence()) })
+		log.Info("swarm.boot.orchestrator_ok", zap.Duration("cadence", epochCadence()))
+	}
 
 	log.Info("swarm.boot.ready")
 
@@ -340,4 +364,129 @@ func fieldsFromKV(kv []any) []zap.Field {
 		out = append(out, zap.Any(k, kv[i+1]))
 	}
 	return out
+}
+
+// eventBusAdapter wraps a redis.Client to satisfy
+// orchestrator.EventBus (Publish(ctx, channel, []byte)). The orchestrator
+// uses this to emit events:epoch_completed at the end of every RunEpoch.
+type eventBusAdapter struct {
+	rdb redis.Client
+}
+
+func (a eventBusAdapter) Publish(ctx context.Context, channel string, payload []byte) error {
+	return a.rdb.Publish(ctx, channel, payload)
+}
+
+// breakerAdapter satisfies orchestrator.BreakerControl with a minimal
+// threshold rule that matches the chunk-21 test fake: when ≥50% of
+// funded nodes hit stop-loss in a single epoch, return "mass_stop_out"
+// to flag the trip. The runtime.CircuitBreaker handles the actual
+// process-wide halt; this adapter is just the orchestrator-side
+// verdict. Halted() is always false here because the orchestrator only
+// uses BreakerControl.EvaluateEpoch — the runtime.CircuitBreaker is
+// the source of truth for monitor/strategist gating.
+type breakerAdapter struct{}
+
+func (breakerAdapter) Halted() bool { return false }
+func (breakerAdapter) EvaluateEpoch(o orchestrator.EpochBreakerOutcome) string {
+	if o.FundedNodes > 0 && float64(o.NodesHitStopLoss)/float64(o.FundedNodes) >= 0.5 {
+		return "mass_stop_out"
+	}
+	return ""
+}
+
+// epochCadence returns the cron interval for RunEpoch. Spec default is
+// hourly; tests and local runs can override with EPOCH_INTERVAL.
+func epochCadence() time.Duration {
+	if v := os.Getenv("EPOCH_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return time.Hour
+}
+
+// runEpochCron fires one epoch on boot (so an operator sees activity
+// within seconds rather than waiting an hour) then ticks at cadence
+// until ctx is cancelled. Each epoch is wrapped in a per-epoch context
+// with a generous timeout so a hung LLM call doesn't poison the cron.
+func runEpochCron(ctx context.Context, log *zap.Logger, pool epochPool, orch *orchestrator.RootOrchestrator, cadence time.Duration) error {
+	runOne := func() {
+		epochCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
+		defer cancel()
+		epochID, err := seedEpochRow(epochCtx, pool)
+		if err != nil {
+			log.Warn("swarm.epoch.seed_failed", zap.Error(err))
+			return
+		}
+		started := time.Now()
+		result, err := orch.RunEpoch(epochCtx, epochID)
+		dur := time.Since(started)
+		if err != nil {
+			log.Error("swarm.epoch.failed", zap.String("epoch_id", epochID), zap.Duration("dur", dur), zap.Error(err))
+			return
+		}
+		log.Info("swarm.epoch.completed",
+			zap.String("epoch_id", epochID),
+			zap.Int("lifecycle_actions", len(result.LifecycleActions)),
+			zap.Int("offspring_decisions", len(result.OffspringDecisions)),
+			zap.Int("postmortems", len(result.Postmortems)),
+			zap.Bool("breaker_tripped", result.BreakerTripped),
+			zap.Duration("dur", dur),
+		)
+	}
+	runOne()
+	t := time.NewTicker(cadence)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-t.C:
+			runOne()
+		}
+	}
+}
+
+// epochPool is the tiny pgx surface seedEpochRow uses. Decoupled so
+// tests can drive the cron with a fake.
+type epochPool interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// seedEpochRow inserts a fresh epoch row and returns its generated UUID.
+// epoch_number is auto-incremented from MAX + 1; total_agents is
+// populated from the current swarm size so the orchestrator's
+// LoadEpochState has a real number to anchor.
+func seedEpochRow(ctx context.Context, pool epochPool) (string, error) {
+	const q = `
+        INSERT INTO epochs (
+            epoch_number, started_at, ended_at,
+            total_agents, treasury_balance, total_pnl
+        ) VALUES (
+            (SELECT COALESCE(MAX(epoch_number), 0) + 1 FROM epochs),
+            now(), now(),
+            (SELECT COUNT(*) FROM agents WHERE status = 'active'),
+            (SELECT COALESCE(SUM(current_balance), 0) FROM agents WHERE name IN ('root_treasury_solana','root_treasury_base')),
+            0
+        )
+        RETURNING id
+    `
+	var id string
+	if err := pool.QueryRow(ctx, q).Scan(&id); err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+// priceStoreAdapter bridges *db.Queries to backtesting.PriceStore — the
+// collector writes PriceRow shaped values, the underlying SQL takes
+// loose columns. Lives here (not in internal/db) so the db package
+// doesn't need to import backtesting.
+type priceStoreAdapter struct {
+	queries *db.Queries
+}
+
+func (a priceStoreAdapter) InsertPriceRow(ctx context.Context, row backtesting.PriceRow) error {
+	return a.queries.InsertPriceHistoryRow(ctx, row.Chain, row.TokenPair, row.Price, row.Volume24h, row.RecordedAt)
 }
