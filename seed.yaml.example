@@ -1,0 +1,73 @@
+# seed.yaml — initial Cambrian swarm composition.
+#
+# Pass this file to cmd/seed-nodes after running cmd/init-treasury once:
+#
+#   go run ./cmd/seed-nodes seed.yaml
+#
+# Spec line 1550 requires the seed cover all four task types and both
+# chains so the first generation has a diverse gene pool. The 3 funded
+# + 5 shadow split matches the chunk 32 acceptance criteria: funded
+# nodes get real capital; shadow nodes paper-trade and graduate into
+# funded slots if they outperform.
+#
+# Re-running this command is idempotent — nodes whose `name` already
+# exists in the agents table are skipped.
+
+nodes:
+  # ---- Funded nodes (3) ----
+  - name: yield-sol-1
+    task_type: cross_chain_yield
+    chain: solana
+    node_class: funded
+    capital_usd: 100
+    strategist_model: claude-haiku-4-5-20251001
+
+  - name: yield-base-1
+    task_type: cross_chain_yield
+    chain: base
+    node_class: funded
+    capital_usd: 100
+    strategist_model: claude-haiku-4-5-20251001
+
+  - name: lp-sol-1
+    task_type: liquidity_provision
+    chain: solana
+    node_class: funded
+    capital_usd: 100
+    strategist_model: claude-haiku-4-5-20251001
+
+  # ---- Shadow nodes (5) — paper-trade, no real capital ----
+  - name: liq-sol-1
+    task_type: liquidation_hunting
+    chain: solana
+    node_class: shadow
+    capital_usd: 0
+    strategist_model: claude-haiku-4-5-20251001
+
+  - name: liq-base-1
+    task_type: liquidation_hunting
+    chain: base
+    node_class: shadow
+    capital_usd: 0
+    strategist_model: claude-haiku-4-5-20251001
+
+  - name: momo-sol-1
+    task_type: momentum
+    chain: solana
+    node_class: shadow
+    capital_usd: 0
+    strategist_model: claude-haiku-4-5-20251001
+
+  - name: momo-base-1
+    task_type: momentum
+    chain: base
+    node_class: shadow
+    capital_usd: 0
+    strategist_model: claude-haiku-4-5-20251001
+
+  - name: lp-base-1
+    task_type: liquidity_provision
+    chain: base
+    node_class: shadow
+    capital_usd: 0
+    strategist_model: claude-haiku-4-5-20251001
