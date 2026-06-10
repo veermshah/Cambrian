@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -429,4 +430,30 @@ func (q *Queries) InsertPostmortem(ctx context.Context, p Postmortem) error {
 
 func (q *Queries) InsertLedgerRow(ctx context.Context, r LedgerRow) error {
 	return errNotImplemented
+}
+
+// InsertPriceHistoryRow appends one observation to the price_history
+// table. Field-by-field rather than a struct so internal/backtesting
+// doesn't need to be imported here (which would cycle: backtesting
+// already depends on internal/chain which depends on tests using
+// fakes — keeping db at the leaf of the import graph is the simplest
+// rule).
+//
+// volume24h ≤ 0 is stored as NULL (the schema marks the column NULL).
+func (q *Queries) InsertPriceHistoryRow(ctx context.Context, chain, tokenPair string, price, volume24h float64, recordedAt time.Time) error {
+	if chain == "" || tokenPair == "" {
+		return errors.New("db: InsertPriceHistoryRow requires chain + token_pair")
+	}
+	const stmt = `
+        INSERT INTO price_history (chain, token_pair, price, volume_24h, recorded_at)
+        VALUES ($1, $2, $3, $4, $5)
+    `
+	var vol any
+	if volume24h > 0 {
+		vol = volume24h
+	}
+	if _, err := q.pool.Exec(ctx, stmt, chain, tokenPair, price, vol, recordedAt); err != nil {
+		return fmt.Errorf("db: insert price history: %w", err)
+	}
+	return nil
 }
