@@ -36,6 +36,7 @@ var ErrAgentNotFound = errors.New("db: agent not found")
 // owns serialization — keeps internal/db from importing the genome package.
 type Agent struct {
 	ID                        string
+	ParentID                  string // empty ⇒ NULL (seed / treasury nodes)
 	Name                      string
 	Chain                     string
 	WalletAddress             string
@@ -95,6 +96,19 @@ type StrategistDecision struct {
 	InputTokens                int
 	OutputTokens               int
 	CostUSD                    float64
+}
+
+// Lineage represents a row in lineage: how a child agent was derived.
+// EvolutionMethod is "mutation" or "crossover"; SecondParentID is set
+// only for crossover. MutationsApplied is free-form JSON provenance
+// (module inheritance, mutation markers).
+type Lineage struct {
+	ChildID          string
+	ParentID         string
+	SecondParentID   string // empty ⇒ NULL
+	EvolutionMethod  string
+	MutationsApplied json.RawMessage
+	SpawnReasoning   string
 }
 
 // Epoch represents a row in epochs.
@@ -159,14 +173,16 @@ func (q *Queries) InsertAgent(ctx context.Context, a Agent) (string, error) {
             strategist_model, strategist_interval_seconds,
             bandit_policies, learned_rules,
             sleep_schedule, reproduction_policy, cost_policy, communication_policy,
-            node_class, generation, lineage_depth, capital_allocated
+            node_class, generation, lineage_depth, capital_allocated,
+            parent_id
         ) VALUES (
             $1, $2, $3, $4,
             $5, $6, $7,
             $8, $9,
             $10, $11,
             $12, $13, $14, $15,
-            $16, $17, $18, $19
+            $16, $17, $18, $19,
+            $20
         )
         RETURNING id
     `
@@ -179,6 +195,7 @@ func (q *Queries) InsertAgent(ctx context.Context, a Agent) (string, error) {
 		bandits, learned,
 		sleep, repro, cost, comms,
 		nodeClass, a.Generation, a.LineageDepth, a.CapitalAllocated,
+		nullableUUID(a.ParentID),
 	).Scan(&id)
 	if err != nil {
 		return "", fmt.Errorf("db: insert agent %q: %w", a.Name, err)
@@ -192,7 +209,8 @@ func (q *Queries) InsertAgent(ctx context.Context, a Agent) (string, error) {
 func (q *Queries) GetAgentByName(ctx context.Context, name string) (Agent, error) {
 	const stmt = `
         SELECT id, name, chain, wallet_address, wallet_key_encrypted,
-               task_type, node_class, generation, lineage_depth
+               task_type, node_class, generation, lineage_depth,
+               COALESCE(parent_id::text, '')
         FROM agents
         WHERE name = $1
         LIMIT 1
@@ -200,7 +218,7 @@ func (q *Queries) GetAgentByName(ctx context.Context, name string) (Agent, error
 	var a Agent
 	err := q.pool.QueryRow(ctx, stmt, name).Scan(
 		&a.ID, &a.Name, &a.Chain, &a.WalletAddress, &a.WalletKeyEncrypted,
-		&a.TaskType, &a.NodeClass, &a.Generation, &a.LineageDepth,
+		&a.TaskType, &a.NodeClass, &a.Generation, &a.LineageDepth, &a.ParentID,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Agent{}, ErrAgentNotFound
@@ -226,18 +244,21 @@ func (q *Queries) TreasuryInitialized(ctx context.Context) (bool, error) {
 	return n >= 2, nil
 }
 
-func defaultJSON(raw json.RawMessage, fallback string) []byte {
+// defaultJSON / nullableJSON hand JSON to pgx as string: a plain []byte
+// argument is encoded as bytea (hex), which json/jsonb columns reject
+// with "invalid input syntax for type json".
+func defaultJSON(raw json.RawMessage, fallback string) string {
 	if len(raw) == 0 {
-		return []byte(fallback)
+		return fallback
 	}
-	return raw
+	return string(raw)
 }
 
 func nullableJSON(raw json.RawMessage) interface{} {
 	if len(raw) == 0 {
 		return nil
 	}
-	return []byte(raw)
+	return string(raw)
 }
 
 func nullableText(s string) interface{} {
@@ -252,6 +273,32 @@ func nullableUUID(s string) interface{} {
 		return nil
 	}
 	return s
+}
+
+// InsertLineage records how a child was derived. Called by the
+// offspring materializer right after InsertAgent for the child.
+func (q *Queries) InsertLineage(ctx context.Context, l Lineage) error {
+	if l.ChildID == "" || l.ParentID == "" {
+		return errors.New("db: lineage requires child_id and parent_id")
+	}
+	method := l.EvolutionMethod
+	if method == "" {
+		method = "mutation"
+	}
+	const stmt = `
+        INSERT INTO lineage (
+            child_id, parent_id, second_parent_id,
+            evolution_method, mutations_applied, spawn_reasoning
+        ) VALUES ($1, $2, $3, $4, $5, $6)
+    `
+	_, err := q.pool.Exec(ctx, stmt,
+		l.ChildID, l.ParentID, nullableUUID(l.SecondParentID),
+		method, defaultJSON(l.MutationsApplied, "{}"), nullableText(l.SpawnReasoning),
+	)
+	if err != nil {
+		return fmt.Errorf("db: insert lineage for %s: %w", l.ChildID, err)
+	}
+	return nil
 }
 
 func (q *Queries) GetAgent(ctx context.Context, id string) (Agent, error) {

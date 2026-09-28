@@ -218,3 +218,44 @@ func TestInsertAgentAcceptsExplicitJSONColumns(t *testing.T) {
 		t.Fatalf("InsertAgent: %v", err)
 	}
 }
+
+func TestInsertChildWithParentAndLineage(t *testing.T) {
+	q := startPostgres(t)
+	ctx := context.Background()
+
+	parentID, err := q.InsertAgent(ctx, sampleAgent())
+	if err != nil {
+		t.Fatalf("InsertAgent parent: %v", err)
+	}
+	child := sampleAgent()
+	child.Name = "child-1"
+	child.WalletAddress = "Sol2222222222222222222222222222222222222222"
+	child.ParentID = parentID
+	child.Generation = 1
+	child.LineageDepth = 1
+	child.LearnedRules = json.RawMessage(`[{"id":"r1","text":"inherited","confidence":0.4}]`)
+	childID, err := q.InsertAgent(ctx, child)
+	if err != nil {
+		t.Fatalf("InsertAgent child: %v", err)
+	}
+	got, err := q.GetAgentByName(ctx, "child-1")
+	if err != nil {
+		t.Fatalf("GetAgentByName: %v", err)
+	}
+	if got.ParentID != parentID {
+		t.Errorf("ParentID = %q, want %q", got.ParentID, parentID)
+	}
+
+	if err := q.InsertLineage(ctx, db.Lineage{
+		ChildID:          childID,
+		ParentID:         parentID,
+		EvolutionMethod:  "mutation",
+		MutationsApplied: json.RawMessage(`{"proposal_id":"p1"}`),
+		SpawnReasoning:   "archive parent",
+	}); err != nil {
+		t.Fatalf("InsertLineage: %v", err)
+	}
+	if err := q.InsertLineage(ctx, db.Lineage{ChildID: childID}); err == nil {
+		t.Fatal("InsertLineage without parent should fail")
+	}
+}

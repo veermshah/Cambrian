@@ -61,6 +61,12 @@ type AgentSnapshot struct {
 	// true, pause shadow nodes (spec line 520 + line 587: "budget tight"
 	// → pause). NodeClass distinguishes shadow vs funded.
 	NodeClass string // "shadow" | "funded"
+
+	// Reproduction inputs (spec line 523 + ReproductionPolicy gates).
+	ProfitableEpochs int     // lifetime count of epochs with positive net profit
+	ChildrenCount    int     // lifetime offspring materialized from this agent
+	LLMCostWindowUSD float64 // LLM spend over the window, for BrainEfficiency
+	SignalAccuracy   float64 // fraction of correct intel broadcasts, 0 when unknown
 }
 
 // LifecyclePolicyConfig pins the thresholds DeterministicPolicy uses.
