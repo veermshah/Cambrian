@@ -1630,6 +1630,33 @@ The deliverables ARE tests. The acceptance criterion is they pass.
 
 ---
 
+## Chunk 34 — Autonomous reproduction: QD archive selection + materialization
+
+### Context
+
+Through chunk 33 the offspring pipeline (solvency → quality check → Bull/Bear → backtest) only *evaluates* proposals that something else inserted; nothing proposes children and approved rows never become live agents. This chunk closes the loop using ideas from Darwin Gödel Machine (archive of all agents as parents, fitness-and-children weighted sampling) and AlphaEvolve / MAP-Elites (niche archive so diverse lineages stay reachable).
+
+### Deliverables
+
+- `internal/orchestrator/reproduction.go`: `BuildEliteArchive` (niche = task_type × chain × strategist_model), `ReproductionEligible` gates (active, funded, no debt, ≥ `MinProfitableEpochs`, ≥ `MinRealizedNetProfitUSD`, pre-funded seed + API reserve + failure buffer, `MaxDescendantsPerEpoch`, no pending proposal), `ParentWeight` = sigmoid((fitness − median)/T) × 1/(1+children) × (1 + novelty × diversity bonus), `ProposeOffspring` (weighted sampling without replacement, mutation or cross-niche crossover, `agent.Inherit` learned rules, rationale + provenance).
+- `RunEpoch`: approved proposals are handed to an `OffspringMaterializer`; new proposals are generated after evaluation (frozen when the breaker is halted or `BudgetTight`) and enqueued via `ProposalEnqueuer`.
+- `internal/runtime/offspring.go`: `OffspringSpawner` — mints a chain wallet under the master key, serializes the genome into `db.Agent` (shadow unless `OffspringSeedCapitalUSD > 0`), `LifecycleManager.Spawn`, then `InsertLineage`.
+- `internal/db`: `Agent.ParentID`, `Lineage` + `InsertLineage`, JSONB parameters passed as text (pgx encodes `[]byte` as bytea → `22P02`).
+- `PostgresEpochStore`: full genome JSON load, profitable-epoch and children counts, `EnqueueOffspringProposal`, `materialized` status + `created_child_id`.
+- `cmd/swarm`: wire spawner + `DefaultReproductionConfig`.
+
+### Acceptance criteria
+
+- Unit tests: eligibility gates, weights, budget freeze, no duplicate pending parents, deterministic selection under fixed RNG, crossover picks another niche, inherited rules regress confidence.
+- Orchestrator tests: approved → materialized (child id persisted), materializer failure leaves `approved`, halted breaker proposes nothing.
+- DB integration: child row with `parent_id`; lineage row round-trip.
+
+### PR
+
+- Title: `feat(34): autonomous reproduction — QD archive parent selection + offspring materialization`
+
+---
+
 ## Done
 
 After chunk 33 merges, the system is feature-complete on devnet. A separate (not-in-this-pack) change flips `NETWORK=mainnet`, funds real treasury wallets, enables the deferred mainnet code paths (Flashbots Protect, mempool guards, real liquidations), and runs a parallel validation report on mainnet with strict capital limits.

@@ -12,6 +12,7 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -225,13 +226,20 @@ func run() error {
 		epochStore := orchestrator.NewPostgresEpochStore(pool)
 		lifecycle := runtime.NewLifecycleManager(queries, rdb, loggerAdapter{log: log})
 		breaker := breakerAdapter{} // simple ≥50%-stop-out gate; see comment
+		masterKey, err := hex.DecodeString(cfg.MasterEncryptionKey)
+		if err != nil {
+			return fmt.Errorf("master encryption key: %w", err)
+		}
+		spawner := runtime.NewOffspringSpawner(lifecycle, queries, runtime.NewChainWallet(masterKey), loggerAdapter{log: log})
 		orch, err := orchestrator.NewRootOrchestrator(orchestrator.RootOrchestratorConfig{
 			Store:              epochStore,
 			Lifecycle:          lifecycle,
+			Materializer:       spawner,
 			Breaker:            breaker,
 			Bus:                eventBusAdapter{rdb: rdb},
 			LLM:                strategistLLM,
 			LifecyclePolicyCfg: orchestrator.DefaultLifecyclePolicyConfig(),
+			Reproduction:       orchestrator.DefaultReproductionConfig(),
 		})
 		if err != nil {
 			return fmt.Errorf("orchestrator: %w", err)

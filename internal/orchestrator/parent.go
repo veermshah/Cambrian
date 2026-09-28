@@ -15,9 +15,9 @@ import (
 // job. The parent orchestrator builds it from db.Queries once per
 // epoch; pure-function epoch logic operates on this snapshot.
 type EpochState struct {
-	EpochID    string
-	StartedAt  time.Time
-	Snapshots  []AgentSnapshot
+	EpochID   string
+	StartedAt time.Time
+	Snapshots []AgentSnapshot
 	// Genomes maps agent_id → genome for quality check / crossover /
 	// postmortem context. Built from the same query that produced
 	// Snapshots.
@@ -57,18 +57,29 @@ type OffspringProposal struct {
 	// ParentCarriedDebt is the parent's outstanding debt at proposal
 	// time. Solvency check rejects when > 0.
 	ParentCarriedDebt float64
+
+	// Provenance written by ProposeOffspring and persisted to
+	// offspring_proposals.rationale + lineage on materialization.
+	EpochID         string
+	EvolutionMethod string // EvolutionMutation | EvolutionCrossover
+	SecondParentID  string // set for crossover
+	Inheritance     *CrossoverInheritance
+	Rationale       string
 }
 
 // OffspringDecision is the per-proposal outcome the pipeline writes to
 // the `offspring_proposals` table.
 type OffspringDecision struct {
-	ProposalID string
-	ParentID   string
-	Outcome    OffspringOutcome
-	RejectTag  string  // e.g. "insolvent", "quality_reject", "adversarial_reject", "backtest_failed"
-	CostUSD    float64 // sum of quality + adversarial + backtest costs
-	Quality    *QualityResult
+	ProposalID  string
+	ParentID    string
+	Outcome     OffspringOutcome
+	RejectTag   string  // e.g. "insolvent", "quality_reject", "adversarial_reject", "backtest_failed"
+	CostUSD     float64 // sum of quality + adversarial + backtest costs
+	Quality     *QualityResult
 	Adversarial *AdversarialResult
+	// ChildID is the materialized agent's UUID; set only when the
+	// proposal was approved and a Materializer was configured.
+	ChildID string
 }
 
 // OffspringOutcome is the closed set of states an offspring proposal
@@ -76,9 +87,10 @@ type OffspringDecision struct {
 type OffspringOutcome string
 
 const (
-	OffspringApproved OffspringOutcome = "approved"
-	OffspringRejected OffspringOutcome = "rejected"
-	OffspringRevise   OffspringOutcome = "revise"
+	OffspringApproved     OffspringOutcome = "approved"
+	OffspringRejected     OffspringOutcome = "rejected"
+	OffspringRevise       OffspringOutcome = "revise"
+	OffspringMaterialized OffspringOutcome = "materialized"
 )
 
 // EpochResult is what RunEpoch returns. The parent orchestrator
@@ -89,10 +101,13 @@ type EpochResult struct {
 	Sweeps             []SweepDecision
 	LifecycleActions   []LifecycleAction
 	OffspringDecisions []OffspringDecision
-	Postmortems        []PostmortemResult
-	BreakerTripped     bool
-	BreakerReason      string
-	EndedAt            time.Time
+	// Proposals are the new candidates queued this epoch for evaluation
+	// next epoch (ProposeOffspring output).
+	Proposals      []OffspringProposal
+	Postmortems    []PostmortemResult
+	BreakerTripped bool
+	BreakerReason  string
+	EndedAt        time.Time
 }
 
 // EpochStore is the narrow DB surface RunEpoch needs. The parent
@@ -104,6 +119,22 @@ type EpochStore interface {
 	PersistOffspringDecision(ctx context.Context, d OffspringDecision) error
 	PersistPostmortem(ctx context.Context, p PostmortemResult, agentID string) error
 	LogEpoch(ctx context.Context, r EpochResult) error
+}
+
+// ProposalEnqueuer is the optional store surface that persists newly
+// generated proposals as `pending` rows for the next epoch to judge.
+// PostgresEpochStore implements it; RunEpoch type-asserts on Store.
+type ProposalEnqueuer interface {
+	EnqueueOffspringProposal(ctx context.Context, p OffspringProposal) error
+}
+
+// OffspringMaterializer turns an approved proposal into a live agent:
+// wallet, agents row, lineage row, lifecycle:spawn event. Returns the
+// child agent's UUID. runtime.OffspringSpawner is the production
+// binding; nil ⇒ approved proposals stay `approved` until an operator
+// materializes them.
+type OffspringMaterializer interface {
+	Materialize(ctx context.Context, p OffspringProposal) (childID string, err error)
 }
 
 // LifecycleExecutor is the runtime side that actually performs kills /
@@ -155,7 +186,9 @@ type RootOrchestratorConfig struct {
 	Breaker            BreakerControl
 	Bus                EventBus
 	LLM                llm.LLMClient
-	Backtest           BacktestRunner // optional
+	Backtest           BacktestRunner        // optional
+	Materializer       OffspringMaterializer // optional
+	Reproduction       ReproductionConfig    // zero ⇒ DefaultReproductionConfig
 	LifecyclePolicyCfg LifecyclePolicyConfig
 	Clock              func() time.Time
 	RNG                func() *rand.Rand
@@ -196,18 +229,22 @@ func NewRootOrchestrator(cfg RootOrchestratorConfig) (*RootOrchestrator, error) 
 	if cfg.MaxLLMTokens <= 0 {
 		cfg.MaxLLMTokens = 1024
 	}
+	if cfg.Reproduction.MaxProposalsPerEpoch <= 0 {
+		cfg.Reproduction = DefaultReproductionConfig()
+	}
 	return &RootOrchestrator{cfg: cfg}, nil
 }
 
 // RunEpoch executes the full per-epoch flow from spec line 487:
 //
-//   1. gather state              (cfg.Store.LoadEpochState)
-//   2. deterministic kill/pause  (DeterministicLifecyclePolicy)
-//   3. execute lifecycle actions (cfg.Lifecycle)
-//   4. process offspring         (solvency → quality → adversarial → backtest)
-//   5. postmortem each killed    (GeneratePostmortem)
-//   6. evaluate breaker triggers (cfg.Breaker.EvaluateEpoch)
-//   7. log epoch + emit event    (cfg.Store.LogEpoch + cfg.Bus.Publish)
+//  1. gather state              (cfg.Store.LoadEpochState)
+//  2. deterministic kill/pause  (DeterministicLifecyclePolicy)
+//  3. execute lifecycle actions (cfg.Lifecycle)
+//  4. process offspring         (solvency → quality → adversarial → backtest → materialize)
+//  5. propose next offspring    (ProposeOffspring — archive-sampled parents, mutation/crossover)
+//  6. postmortem each killed    (GeneratePostmortem)
+//  7. evaluate breaker triggers (cfg.Breaker.EvaluateEpoch)
+//  8. log epoch + emit event    (cfg.Store.LogEpoch + cfg.Bus.Publish)
 //
 // Settlement / sweep / cost attribution are wired by the parent process's
 // main loop before RunEpoch fires — by the time RunEpoch sees the
@@ -245,8 +282,25 @@ func (r *RootOrchestrator) RunEpoch(ctx context.Context, epochID string) (EpochR
 	// in order and rejects on the first failure.
 	for _, prop := range state.OffspringProposals {
 		decision := r.processOffspring(ctx, state, prop)
+		if decision.Outcome == OffspringApproved && r.cfg.Materializer != nil {
+			if childID, err := r.cfg.Materializer.Materialize(ctx, prop); err == nil {
+				decision.ChildID = childID
+				decision.Outcome = OffspringMaterialized
+			}
+		}
 		result.OffspringDecisions = append(result.OffspringDecisions, decision)
 		_ = r.cfg.Store.PersistOffspringDecision(ctx, decision)
+	}
+
+	// Step: queue next epoch's candidates. Judged next epoch so the LLM
+	// gates above see a settled ledger for the parent.
+	if !r.cfg.Breaker.Halted() {
+		result.Proposals = ProposeOffspring(r.cfg.RNG(), r.cfg.Reproduction, state)
+		if enq, ok := r.cfg.Store.(ProposalEnqueuer); ok {
+			for _, p := range result.Proposals {
+				_ = enq.EnqueueOffspringProposal(ctx, p)
+			}
+		}
 	}
 
 	// Step: postmortems for agents killed this epoch.

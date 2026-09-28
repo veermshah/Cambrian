@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -60,20 +61,43 @@ func (s *PostgresEpochStore) LoadEpochState(ctx context.Context, epochID string)
 	}
 
 	// Snapshots + genomes — one pass over agents.
+	//
+	// The two LATERAL joins pull the reproduction inputs: the latest
+	// ledger row (window net profit + LLM spend) and lifetime counts of
+	// profitable epochs / materialized children.
 	const agentsQ = `
-        SELECT id, name, status, node_class, chain, task_type,
-               COALESCE(current_balance, 0),
-               COALESCE(consecutive_negative_epochs, 0),
-               COALESCE(unpaid_operating_debt_usd, 0),
-               COALESCE(last_heartbeat_at, '0001-01-01T00:00:00Z'::timestamptz),
-               COALESCE(total_pnl, 0),
-               COALESCE(peak_balance, 0),
-               strategist_prompt, strategist_model,
-               COALESCE(strategist_interval_seconds, 14400),
-               generation, lineage_depth,
-               COALESCE(capital_allocated, 0)
-        FROM agents
-        WHERE status IN ('active', 'paused')
+        SELECT a.id, a.name, a.status, a.node_class, a.chain, a.task_type,
+               COALESCE(a.current_balance, 0),
+               COALESCE(a.consecutive_negative_epochs, 0),
+               COALESCE(a.unpaid_operating_debt_usd, 0),
+               COALESCE(a.last_heartbeat_at, '0001-01-01T00:00:00Z'::timestamptz),
+               COALESCE(a.total_pnl, 0),
+               COALESCE(a.peak_balance, 0),
+               a.strategist_prompt, a.strategist_model,
+               COALESCE(a.strategist_interval_seconds, 14400),
+               a.generation, a.lineage_depth,
+               COALESCE(a.capital_allocated, 0),
+               a.strategy_config, a.bandit_policies, a.learned_rules,
+               a.sleep_schedule, a.reproduction_policy, a.cost_policy,
+               a.communication_policy,
+               COALESCE(l.realized_net_profit_usd, 0),
+               COALESCE(l.llm_cost_usd, 0),
+               COALESCE(h.profitable_epochs, 0),
+               COALESCE(k.children, 0)
+        FROM agents a
+        LEFT JOIN LATERAL (
+            SELECT realized_net_profit_usd, llm_cost_usd
+            FROM agent_ledgers WHERE agent_id = a.id
+            ORDER BY created_at DESC LIMIT 1
+        ) l ON true
+        LEFT JOIN LATERAL (
+            SELECT COUNT(*) AS profitable_epochs
+            FROM agent_ledgers WHERE agent_id = a.id AND realized_net_profit_usd > 0
+        ) h ON true
+        LEFT JOIN LATERAL (
+            SELECT COUNT(*) AS children FROM agents c WHERE c.parent_id = a.id
+        ) k ON true
+        WHERE a.status IN ('active', 'paused')
     `
 	rows, err := s.pool.Query(ctx, agentsQ)
 	if err != nil {
@@ -82,22 +106,27 @@ func (s *PostgresEpochStore) LoadEpochState(ctx context.Context, epochID string)
 	defer rows.Close()
 	for rows.Next() {
 		var (
-			snap     AgentSnapshot
-			name     string
-			chain    string
-			taskType string
-			pnl, peak float64
-			prompt   string
-			model    string
-			interval int
+			snap       AgentSnapshot
+			name       string
+			chain      string
+			taskType   string
+			pnl, peak  float64
+			prompt     string
+			model      string
+			interval   int
 			gen, depth int
-			capital  float64
+			capital    float64
+			gj         genomeJSON
 		)
 		if err := rows.Scan(
 			&snap.AgentID, &name, &snap.Status, &snap.NodeClass, &chain, &taskType,
 			&snap.BalanceUSD, &snap.ConsecutiveLosingEpochs, &snap.OperatingDebtUSD,
 			&snap.LastHeartbeat, &pnl, &peak,
 			&prompt, &model, &interval, &gen, &depth, &capital,
+			&gj.strategy, &gj.bandits, &gj.rules,
+			&gj.sleep, &gj.repro, &gj.cost, &gj.comms,
+			&snap.NetProfitWindowUSD, &snap.LLMCostWindowUSD,
+			&snap.ProfitableEpochs, &snap.ChildrenCount,
 		); err != nil {
 			return state, fmt.Errorf("scan agent snapshot: %w", err)
 		}
@@ -116,7 +145,7 @@ func (s *PostgresEpochStore) LoadEpochState(ctx context.Context, epochID string)
 		}
 		state.Snapshots = append(state.Snapshots, snap)
 		state.CarriedDebt[snap.AgentID] = snap.OperatingDebtUSD
-		state.Genomes[snap.AgentID] = agent.AgentGenome{
+		g := agent.AgentGenome{
 			Name:                      name,
 			TaskType:                  taskType,
 			Chain:                     chain,
@@ -127,7 +156,9 @@ func (s *PostgresEpochStore) LoadEpochState(ctx context.Context, epochID string)
 			LineageDepth:              depth,
 			CapitalAllocation:         capital,
 		}
-		state.SwarmGenomes = append(state.SwarmGenomes, state.Genomes[snap.AgentID])
+		gj.applyTo(&g)
+		state.Genomes[snap.AgentID] = g
+		state.SwarmGenomes = append(state.SwarmGenomes, g)
 	}
 	if err := rows.Err(); err != nil {
 		return state, err
@@ -142,7 +173,9 @@ func (s *PostgresEpochStore) LoadEpochState(ctx context.Context, epochID string)
                op.requested_api_reserve_usd,
                op.requested_failure_buffer_usd,
                op.proposed_genome,
-               COALESCE(p.unpaid_operating_debt_usd, 0)
+               COALESCE(p.unpaid_operating_debt_usd, 0),
+               COALESCE(op.epoch_id::text, ''),
+               op.rationale
         FROM offspring_proposals op
         LEFT JOIN agents p ON p.id = op.proposing_agent_id
         WHERE op.status IN ('pending', 'quality_check', 'adversarial_review')
@@ -155,19 +188,21 @@ func (s *PostgresEpochStore) LoadEpochState(ctx context.Context, epochID string)
 	defer oRows.Close()
 	for oRows.Next() {
 		var (
-			prop      OffspringProposal
+			prop                   OffspringProposal
 			seed, reserve, failBuf float64
-			genomeRaw []byte
+			genomeRaw              []byte
 		)
 		if err := oRows.Scan(
 			&prop.ProposalID, &prop.ParentID,
 			&seed, &reserve, &failBuf,
 			&genomeRaw, &prop.ParentCarriedDebt,
+			&prop.EpochID, &prop.Rationale,
 		); err != nil {
 			return state, fmt.Errorf("scan offspring: %w", err)
 		}
 		prop.ReproductionReserveUSD = seed + reserve + failBuf
 		_ = json.Unmarshal(genomeRaw, &prop.Candidate)
+		prop.EvolutionMethod, prop.SecondParentID, prop.Rationale = parseProvenance(prop.Rationale)
 		// ParentLedger: fetch the parent's most recent ledger row so the
 		// solvency gate in RunEpoch can read RealizedNetProfit.
 		prop.ParentLedger = s.latestLedgerFor(ctx, prop.ParentID)
@@ -178,6 +213,106 @@ func (s *PostgresEpochStore) LoadEpochState(ctx context.Context, epochID string)
 	}
 
 	return state, nil
+}
+
+// genomeJSON holds the agents-table JSONB module columns for one row.
+// Unmarshal failures leave the module at its zero value so one corrupt
+// column can't stall the whole epoch.
+type genomeJSON struct {
+	strategy, bandits, rules, sleep, repro, cost, comms []byte
+}
+
+func (j genomeJSON) applyTo(g *agent.AgentGenome) {
+	decode := func(raw []byte, dst any) {
+		if len(raw) > 0 {
+			_ = json.Unmarshal(raw, dst)
+		}
+	}
+	decode(j.strategy, &g.StrategyConfig)
+	decode(j.bandits, &g.BanditPolicies)
+	decode(j.rules, &g.LearnedRules)
+	decode(j.sleep, &g.SleepSchedule)
+	decode(j.repro, &g.ReproductionPolicy)
+	decode(j.cost, &g.CostPolicy)
+	decode(j.comms, &g.CommunicationPolicy)
+}
+
+// Compile-time assertion: the store can queue proposer output.
+var _ ProposalEnqueuer = (*PostgresEpochStore)(nil)
+
+// EnqueueOffspringProposal inserts a `pending` offspring_proposals row
+// from ProposeOffspring output. The proposal's provenance (method,
+// second parent, module inheritance) rides in the rationale text and
+// is re-derived from the candidate genome at materialization time; the
+// lineage row is written by the OffspringMaterializer.
+func (s *PostgresEpochStore) EnqueueOffspringProposal(ctx context.Context, p OffspringProposal) error {
+	if p.ParentID == "" {
+		return errors.New("orchestrator: EnqueueOffspringProposal requires parent_id")
+	}
+	genome, err := json.Marshal(p.Candidate)
+	if err != nil {
+		return fmt.Errorf("orchestrator: marshal candidate genome: %w", err)
+	}
+	rp := p.Candidate.ReproductionPolicy
+	seed, api, fail := rp.OffspringSeedCapitalUSD, rp.OffspringAPIReserveUSD, rp.OffspringFailureBufferUSD
+	if seed+api+fail == 0 {
+		seed = p.ReproductionReserveUSD
+	}
+	var epochID any
+	if p.EpochID != "" {
+		epochID = p.EpochID
+	}
+	rationale := formatProvenance(p.EvolutionMethod, p.SecondParentID, p.Rationale)
+	const q = `
+        INSERT INTO offspring_proposals (
+            proposing_agent_id, epoch_id, proposed_genome,
+            requested_seed_capital_usd, requested_api_reserve_usd,
+            requested_failure_buffer_usd, rationale, status
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')
+    `
+	if _, err := s.pool.Exec(ctx, q,
+		p.ParentID, epochID, string(genome),
+		seed, api, fail, rationale,
+	); err != nil {
+		return fmt.Errorf("orchestrator: enqueue offspring proposal: %w", err)
+	}
+	return nil
+}
+
+// formatProvenance prefixes the rationale with a machine-readable
+// "[method second_parent=<id>] " tag so provenance survives the round
+// trip through offspring_proposals.rationale (the table has no
+// dedicated columns for it). parseProvenance is the inverse.
+func formatProvenance(method, secondParent, rationale string) string {
+	if method == "" {
+		return rationale
+	}
+	tag := "[" + method
+	if secondParent != "" {
+		tag += " second_parent=" + secondParent
+	}
+	return tag + "] " + rationale
+}
+
+func parseProvenance(rationale string) (method, secondParent, rest string) {
+	if !strings.HasPrefix(rationale, "[") {
+		return "", "", rationale
+	}
+	end := strings.Index(rationale, "] ")
+	if end < 0 {
+		return "", "", rationale
+	}
+	fields := strings.Fields(rationale[1:end])
+	if len(fields) == 0 {
+		return "", "", rationale
+	}
+	method = fields[0]
+	for _, f := range fields[1:] {
+		if v, ok := strings.CutPrefix(f, "second_parent="); ok {
+			secondParent = v
+		}
+	}
+	return method, secondParent, rationale[end+2:]
 }
 
 // latestLedgerFor returns the most recent agent_ledgers row for the
@@ -297,6 +432,8 @@ func (s *PostgresEpochStore) PersistOffspringDecision(ctx context.Context, d Off
 		status = "rejected"
 	case OffspringRevise:
 		status = "pending"
+	case OffspringMaterialized:
+		status = "materialized"
 	}
 	const q = `
         UPDATE offspring_proposals
@@ -306,9 +443,14 @@ func (s *PostgresEpochStore) PersistOffspringDecision(ctx context.Context, d Off
             quality_check_reasoning = COALESCE($5, quality_check_reasoning),
             bull_case = COALESCE($6, bull_case),
             bear_case = COALESCE($7, bear_case),
-            adversarial_synthesis = COALESCE($8, adversarial_synthesis)
+            adversarial_synthesis = COALESCE($8, adversarial_synthesis),
+            created_child_id = COALESCE($9, created_child_id)
         WHERE id = $1
     `
+	var childID any
+	if d.ChildID != "" {
+		childID = d.ChildID
+	}
 	var qVerdict, qReason, bull, bear, synth any
 	if d.Quality != nil {
 		qVerdict = string(d.Quality.Verdict)
@@ -325,7 +467,7 @@ func (s *PostgresEpochStore) PersistOffspringDecision(ctx context.Context, d Off
 	}
 	_, err := s.pool.Exec(ctx, q,
 		d.ProposalID, status, rejectReason,
-		qVerdict, qReason, bull, bear, synth,
+		qVerdict, qReason, bull, bear, synth, childID,
 	)
 	if err != nil {
 		return fmt.Errorf("orchestrator: persist offspring decision: %w", err)
@@ -413,7 +555,7 @@ func (s *PostgresEpochStore) LogEpoch(ctx context.Context, r EpochResult) error 
 	}
 	var approved int
 	for _, d := range r.OffspringDecisions {
-		if d.Outcome == OffspringApproved {
+		if d.Outcome == OffspringApproved || d.Outcome == OffspringMaterialized {
 			approved++
 		}
 	}
@@ -442,7 +584,7 @@ func (s *PostgresEpochStore) LogEpoch(ctx context.Context, r EpochResult) error 
             agents_spawned = EXCLUDED.agents_spawned,
             circuit_breaker_triggered = EXCLUDED.circuit_breaker_triggered
     `
-	startedAt := r.EndedAt.Add(-1 * time.Minute) // placeholder; parent loop owns started_at
+	startedAt := r.EndedAt.Add(-1 * time.Minute)        // placeholder; parent loop owns started_at
 	totalAgents := killed + paused + resumed + approved // best-effort; the loop carries the precise count
 	// _ used vars
 	_ = paused
