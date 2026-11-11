@@ -172,7 +172,8 @@ pure-logic suites pass (evolution, bandit convergence, learned rules,
 knowledge graph, signal accuracy, budget, hibernation, diversity, hot reload,
 transaction validation); 5 live suites are waiting on a full devnet run.
 
-CI runs `go vet` and `go test` on every push and pull request.
+CI runs `go vet` and `go test` on every push and pull request; GitHub runners have Docker, so the
+Postgres-backed tests in `internal/db` run there too.
 
 ## Design decisions
 
