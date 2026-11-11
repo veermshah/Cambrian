@@ -226,18 +226,22 @@ func (q *Queries) TreasuryInitialized(ctx context.Context) (bool, error) {
 	return n >= 2, nil
 }
 
-func defaultJSON(raw json.RawMessage, fallback string) []byte {
+// JSON parameters are passed as strings, not []byte. The pool runs in
+// QueryExecModeExec, where pgx sends parameters as untyped text and
+// encodes []byte as a bytea hex literal ("\\x7b7d"), which Postgres
+// rejects for json/jsonb columns. A string is sent verbatim.
+func defaultJSON(raw json.RawMessage, fallback string) string {
 	if len(raw) == 0 {
-		return []byte(fallback)
+		return fallback
 	}
-	return raw
+	return string(raw)
 }
 
 func nullableJSON(raw json.RawMessage) interface{} {
 	if len(raw) == 0 {
 		return nil
 	}
-	return []byte(raw)
+	return string(raw)
 }
 
 func nullableText(s string) interface{} {

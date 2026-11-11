@@ -383,7 +383,9 @@ func (s *PostgresEpochStore) PersistPostmortem(ctx context.Context, p Postmortem
 		agentID, name,
 		lifespanEpochs, trades, pnl,
 		p.CostUSD,
-		strategyConfig, prompt, banditState,
+		// jsonb values go back as strings: in QueryExecModeExec pgx would
+		// encode []byte as a bytea hex literal, which jsonb rejects.
+		string(strategyConfig), prompt, string(banditState),
 		p.Diagnosis, p.Summary, string(p.Category),
 	)
 	if err != nil {
