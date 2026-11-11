@@ -37,6 +37,8 @@ func TestMigrationsUpDownRoundTrip(t *testing.T) {
 	if os.Getenv("TESTCONTAINERS_DISABLED") == "1" {
 		t.Skip("TESTCONTAINERS_DISABLED=1 — skipping testcontainers-backed test")
 	}
+	// Skip rather than fail on machines without a running Docker daemon.
+	testcontainers.SkipIfProviderIsNotHealthy(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
